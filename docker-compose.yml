@@ -1,0 +1,23 @@
+services:
+  vault-mcp:
+    build: .
+    container_name: vault-mcp-server
+    restart: unless-stopped
+    ports:
+      - "8091:8080"
+    volumes:
+      # Mount your Markdown vault directory
+      - /path/to/your/markdown-vault:/vault
+      # ChromaDB persistence for semantic search
+      - chroma_data:/app/chroma_data
+    environment:
+      - VAULT_PATH=/vault
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - CHROMA_PATH=/app/chroma_data
+      # Optional: OAuth for remote deployment behind Cloudflare Access
+      # - OAUTH_ISSUER_URL=https://your-domain.com
+      # - OAUTH_PIN=${OAUTH_PIN}
+
+volumes:
+  chroma_data:

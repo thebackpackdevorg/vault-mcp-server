@@ -1,0 +1,13 @@
+# Vault MCP Server Configuration
+vault:
+  # Path to the Markdown vault directory
+  # Override with VAULT_PATH environment variable
+  path: "/vault"
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+search:
+  chroma_path: "/app/chroma_data"
+  model: "paraphrase-multilingual-MiniLM-L12-v2"
