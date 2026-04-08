@@ -48,6 +48,12 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", _search_config.get("model", 
 OAUTH_ISSUER_URL = os.environ.get("OAUTH_ISSUER_URL", "")
 OAUTH_PIN = os.environ.get("OAUTH_PIN", "")
 
+# Filesystem watcher: re-index .md files in VAULT_PATH on external changes
+# (git pull, manual edits, sync scripts). Set VAULT_WATCH=false to disable.
+VAULT_WATCH = os.environ.get("VAULT_WATCH", "true").strip().lower() not in (
+    "false", "0", "no", "off",
+)
+
 # ---------------------------------------------------------------------------
 # MCP Server (with optional OAuth)
 # ---------------------------------------------------------------------------
@@ -82,7 +88,7 @@ if OAUTH_ISSUER_URL:
 mcp = FastMCP(**_mcp_kwargs)
 
 # Semantic search indexer
-indexer = VaultIndexer(VAULT_PATH, CHROMA_PATH, EMBEDDING_MODEL)
+indexer = VaultIndexer(VAULT_PATH, CHROMA_PATH, EMBEDDING_MODEL, watch_files=VAULT_WATCH)
 
 
 def _list_md_files() -> list[str]:
