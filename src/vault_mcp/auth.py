@@ -1,10 +1,21 @@
-"""Simple in-memory OAuth 2.1 provider for single-user MCP server."""
+"""Simple OAuth 2.1 provider for single-user MCP server.
 
+State (registered clients + issued tokens) lives in memory by default. Pass
+``state_path`` to persist it to a JSON file on disk so tokens survive server
+restarts — without persistence, every restart forces all connected clients
+(claude.ai web, Claude desktop, etc.) to re-authenticate via the PIN flow.
+"""
+
+import asyncio
+import json
 import logging
+import os
 import secrets
+import tempfile
 import time
 import urllib.parse
 import uuid
+from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
@@ -91,22 +102,33 @@ _ERROR_HTML = """<!DOCTYPE html>
 # ---------------------------------------------------------------------------
 
 class SimpleOAuthProvider:
-    """In-memory OAuth 2.1 provider for a personal, single-user MCP server.
+    """OAuth 2.1 provider for a personal, single-user MCP server.
 
-    Stores clients, authorization codes, and tokens in memory.
-    Tokens survive until server restart (acceptable for personal use).
+    Stores clients, authorization codes, and issued tokens in memory.
+    Authorization codes and pending requests are always ephemeral (short
+    expiry by design). Registered clients, access tokens, and refresh tokens
+    are optionally persisted to ``state_path`` so they survive server
+    restarts.
     """
 
-    def __init__(self, issuer_url: str, pin: str = ""):
+    def __init__(self, issuer_url: str, pin: str = "", state_path: Path | None = None):
         self.issuer_url = issuer_url.rstrip("/")
         self.pin = pin  # empty = no PIN required
+        self._state_path = Path(state_path) if state_path else None
+        self._save_lock = asyncio.Lock()
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
         self._pending: dict[str, dict] = {}
 
-        # Permanent token for Cloudflare Access bypass
+        # Load any persisted state BEFORE adding the per-process cf bypass
+        # token, so the bypass token never gets serialized.
+        if self._state_path:
+            self._load_sync()
+
+        # Permanent token for Cloudflare Access bypass — regenerated each
+        # process start, intentionally NOT persisted.
         self._cf_token = secrets.token_hex(32)
         self._access_tokens[self._cf_token] = AccessToken(
             token=self._cf_token,
@@ -114,7 +136,103 @@ class SimpleOAuthProvider:
             scopes=[],
             expires_at=None,
         )
-        logger.info("OAuth provider initialized (in-memory, single-user)")
+
+        if self._state_path:
+            logger.info(
+                "OAuth provider initialized — state path: %s, "
+                "loaded %d clients / %d access tokens / %d refresh tokens",
+                self._state_path,
+                len(self._clients),
+                len(self._access_tokens) - 1,  # minus cf bypass
+                len(self._refresh_tokens),
+            )
+        else:
+            logger.info("OAuth provider initialized (in-memory, single-user)")
+
+    # -- State persistence --------------------------------------------------
+
+    def _load_sync(self) -> None:
+        """Load persisted clients + tokens from disk if the state file exists."""
+        if not self._state_path or not self._state_path.exists():
+            return
+        try:
+            data = json.loads(self._state_path.read_text())
+        except Exception:
+            logger.exception("Failed to read OAuth state file %s — starting fresh", self._state_path)
+            return
+
+        if data.get("version") != 1:
+            logger.warning(
+                "OAuth state file version %r unrecognized — starting fresh",
+                data.get("version"),
+            )
+            return
+
+        try:
+            self._clients = {
+                k: OAuthClientInformationFull.model_validate(v)
+                for k, v in data.get("clients", {}).items()
+            }
+            self._access_tokens = {
+                k: AccessToken.model_validate(v)
+                for k, v in data.get("access_tokens", {}).items()
+            }
+            self._refresh_tokens = {
+                k: RefreshToken.model_validate(v)
+                for k, v in data.get("refresh_tokens", {}).items()
+            }
+        except Exception:
+            logger.exception("Failed to deserialize OAuth state — starting fresh")
+            self._clients = {}
+            self._access_tokens = {}
+            self._refresh_tokens = {}
+
+    def _save_sync(self) -> None:
+        """Atomically write the persisted state to disk."""
+        if not self._state_path:
+            return
+
+        data = {
+            "version": 1,
+            "clients": {
+                k: v.model_dump(mode="json") for k, v in self._clients.items()
+            },
+            "access_tokens": {
+                k: v.model_dump(mode="json")
+                for k, v in self._access_tokens.items()
+                if k != self._cf_token  # never persist the per-process bypass
+            },
+            "refresh_tokens": {
+                k: v.model_dump(mode="json") for k, v in self._refresh_tokens.items()
+            },
+        }
+
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self._state_path.parent), prefix=".oauth-state-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self._state_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    async def _save(self) -> None:
+        """Schedule a non-blocking persist of the current state."""
+        if not self._state_path:
+            return
+        async with self._save_lock:
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, self._save_sync)
+            except Exception:
+                logger.exception("Failed to persist OAuth state to %s", self._state_path)
 
     @property
     def cf_bypass_token(self) -> str:
@@ -128,6 +246,7 @@ class SimpleOAuthProvider:
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self._clients[client_info.client_id] = client_info
         logger.info("Registered OAuth client: %s", client_info.client_id)
+        await self._save()
 
     # -- Authorization flow -------------------------------------------------
 
@@ -191,6 +310,7 @@ class SimpleOAuthProvider:
         )
 
         logger.info("Issued tokens for client %s (expires in %dd)", client.client_id, expires_in // 86400)
+        await self._save()
         return OAuthToken(
             access_token=access_token,
             token_type="Bearer",
@@ -234,6 +354,9 @@ class SimpleOAuthProvider:
             client_id=client.client_id,
             scopes=use_scopes,
         )
+        # Drop the old refresh token now that we've rotated it
+        self._refresh_tokens.pop(refresh_token.token, None)
+        await self._save()
 
         return OAuthToken(
             access_token=access_token,
@@ -250,6 +373,7 @@ class SimpleOAuthProvider:
             return None
         if access_token.expires_at and access_token.expires_at < int(time.time()):
             self._access_tokens.pop(token, None)
+            await self._save()
             return None
         return access_token
 
@@ -261,6 +385,7 @@ class SimpleOAuthProvider:
     ) -> None:
         self._access_tokens.pop(token.token, None)
         self._refresh_tokens.pop(token.token, None)
+        await self._save()
 
     # -- Approval page helpers ----------------------------------------------
 

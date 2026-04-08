@@ -47,6 +47,10 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", _search_config.get("model", 
 # OAuth (empty ISSUER_URL = disabled, for backward compatibility)
 OAUTH_ISSUER_URL = os.environ.get("OAUTH_ISSUER_URL", "")
 OAUTH_PIN = os.environ.get("OAUTH_PIN", "")
+# Optional path to a JSON file used to persist registered OAuth clients +
+# issued tokens across server restarts. When unset (default), all OAuth
+# state lives in memory only — every restart forces clients to re-auth.
+OAUTH_STATE_PATH = os.environ.get("OAUTH_STATE_PATH", "")
 
 # ---------------------------------------------------------------------------
 # MCP Server (with optional OAuth)
@@ -70,7 +74,11 @@ oauth_provider: SimpleOAuthProvider | None = None
 if OAUTH_ISSUER_URL:
     from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 
-    oauth_provider = SimpleOAuthProvider(OAUTH_ISSUER_URL, pin=OAUTH_PIN)
+    oauth_provider = SimpleOAuthProvider(
+        OAUTH_ISSUER_URL,
+        pin=OAUTH_PIN,
+        state_path=Path(OAUTH_STATE_PATH) if OAUTH_STATE_PATH else None,
+    )
     _mcp_kwargs["auth"] = AuthSettings(
         issuer_url=OAUTH_ISSUER_URL,
         resource_server_url=OAUTH_ISSUER_URL,
