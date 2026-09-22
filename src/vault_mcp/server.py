@@ -48,6 +48,15 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", _search_config.get("model", 
 OAUTH_ISSUER_URL = os.environ.get("OAUTH_ISSUER_URL", "")
 OAUTH_PIN = os.environ.get("OAUTH_PIN", "")
 
+# DNS rebinding protection allowed hosts (comma-separated). When binding to
+# 127.0.0.1/localhost FastMCP auto-enables protection with only localhost in
+# the allowlist; if you front the server with a reverse proxy or tunnel that
+# rewrites the Host header (e.g. Cloudflare Tunnel for vault.example.com),
+# add those hostnames here. Wildcards like "vault.example.com:*" are honored.
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+
 # ---------------------------------------------------------------------------
 # MCP Server (with optional OAuth)
 # ---------------------------------------------------------------------------
@@ -64,6 +73,18 @@ _mcp_kwargs: dict = dict(
     host=SERVER_HOST,
     port=SERVER_PORT,
 )
+
+if ALLOWED_HOSTS:
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    # Merge user-provided hosts with the localhost defaults FastMCP would
+    # otherwise inject so we don't break local stdio/HTTP testing.
+    _allowed = ["127.0.0.1:*", "localhost:*", "[::1]:*", *ALLOWED_HOSTS]
+    _mcp_kwargs["transport_security"] = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed,
+    )
+    logger.info("DNS rebinding allowed_hosts: %s", _allowed)
 
 oauth_provider: SimpleOAuthProvider | None = None
 
