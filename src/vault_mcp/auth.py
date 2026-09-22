@@ -35,7 +35,7 @@ _APPROVE_HTML = """<!DOCTYPE html>
   h1 {{ font-size: 1.3rem; margin: 0 0 8px; color: #f0f6fc; }}
   .client {{ color: #58a6ff; font-weight: 600; }}
   p {{ color: #8b949e; font-size: 0.9rem; line-height: 1.5; }}
-  .pin-field {{ width: 120px; padding: 8px 12px; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #f0f6fc; font-size: 1.1rem; text-align: center; letter-spacing: 4px; margin: 12px auto; display: block; }}
+  .pin-field {{ min-width: 120px; max-width: 280px; padding: 8px 12px; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #f0f6fc; font-size: 1.1rem; text-align: center; letter-spacing: 2px; margin: 12px auto; display: block; }}
   .pin-field:focus {{ outline: none; border-color: #58a6ff; }}
   .pin-label {{ color: #8b949e; font-size: 0.8rem; margin-bottom: 4px; }}
   .btn {{ display: inline-block; padding: 10px 32px; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; margin: 8px; font-weight: 500; }}
@@ -315,10 +315,14 @@ def _render_approve_page(
 ) -> str:
     pin_field = ""
     if provider.pin:
+        # maxlength must accommodate the configured PIN; otherwise the browser
+        # silently truncates the user's input and they get "Wrong PIN" with
+        # no visible cause. Pad upward so the input never blocks a valid PIN.
+        pin_maxlen = max(len(provider.pin), 16)
         pin_field = (
             '<label class="pin-label">PIN</label>'
-            '<input class="pin-field" type="password" name="pin" '
-            'maxlength="10" autocomplete="off" required>'
+            f'<input class="pin-field" type="password" name="pin" '
+            f'maxlength="{pin_maxlen}" autocomplete="off" required>'
         )
     error_msg = f'<p class="error">{error}</p>' if error else ""
     return _APPROVE_HTML.format(
