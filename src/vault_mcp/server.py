@@ -378,6 +378,9 @@ async def vault_reindex() -> str:
     Returns:
         Index statistics (files processed, chunks created, time elapsed).
     """
+    if not indexer.is_ready:
+        return "Indexing in progress. Please try again in a few seconds."
+
     stats = await indexer.index_all(force=True)
     return (
         f"Re-index complete.\n"
