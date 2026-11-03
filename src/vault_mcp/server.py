@@ -12,7 +12,12 @@ from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from .auth import CfAccessBypassMiddleware, SimpleOAuthProvider, create_approve_routes
+from .auth import (
+    CfAccessBypassMiddleware,
+    CfAccessValidator,
+    SimpleOAuthProvider,
+    create_approve_routes,
+)
 from .indexer import VaultIndexer
 from .parser import (
     extract_cross_references,
@@ -51,6 +56,14 @@ OAUTH_PIN = os.environ.get("OAUTH_PIN", "")
 # issued tokens across server restarts. When unset (default), all OAuth
 # state lives in memory only — every restart forces clients to re-auth.
 OAUTH_STATE_PATH = os.environ.get("OAUTH_STATE_PATH", "")
+
+# Cloudflare Access door. The bypass that trusts Cf-Access-Jwt-Assertion is only
+# armed when BOTH are set; otherwise it fails closed (header ignored).
+# CF_ACCESS_TEAM_DOMAIN: comma-separated team domain(s) allowed as JWT issuer,
+#   e.g. "yourteam.cloudflareaccess.com".
+# CF_ACCESS_AUD: the Access application AUD tag for this app.
+CF_ACCESS_TEAM_DOMAIN = os.environ.get("CF_ACCESS_TEAM_DOMAIN", "")
+CF_ACCESS_AUD = os.environ.get("CF_ACCESS_AUD", "")
 
 # DNS rebinding protection allowed hosts (comma-separated). When binding to
 # 127.0.0.1/localhost FastMCP auto-enables protection with only localhost in
@@ -91,6 +104,19 @@ if ALLOWED_HOSTS:
     logger.info("DNS rebinding allowed_hosts: %s", _allowed)
 
 oauth_provider: SimpleOAuthProvider | None = None
+
+# CF Access JWT validator (armed only when team domain + AUD are configured).
+cf_access_validator: CfAccessValidator | None = None
+if CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD:
+    cf_access_validator = CfAccessValidator(
+        team_domains=CF_ACCESS_TEAM_DOMAIN.split(","),
+        audience=CF_ACCESS_AUD,
+    )
+    logger.info(
+        "CF Access validator enabled — issuers: %s, aud: %s…",
+        CF_ACCESS_TEAM_DOMAIN,
+        CF_ACCESS_AUD[:8],
+    )
 
 if OAUTH_ISSUER_URL:
     from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -453,7 +479,11 @@ def main():
 
     # If OAuth is enabled, add CF Access bypass (outermost middleware — runs first)
     if oauth_provider:
-        app.add_middleware(CfAccessBypassMiddleware, bypass_token=oauth_provider.cf_bypass_token)
+        app.add_middleware(
+            CfAccessBypassMiddleware,
+            bypass_token=oauth_provider.cf_bypass_token,
+            validator=cf_access_validator,
+        )
 
     # Wrap the existing lifespan to add background indexing
     original_lifespan = app.router.lifespan_context

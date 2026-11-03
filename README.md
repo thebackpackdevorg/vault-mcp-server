@@ -119,6 +119,10 @@ To access the vault from other machines, expose it through a reverse proxy. The 
 
 Set `OAUTH_ISSUER_URL` and optionally `OAUTH_PIN` in your environment to enable the built-in OAuth 2.1 provider with a PIN-based approval page.
 
+### Combining OAuth with Cloudflare Access
+
+When OAuth is enabled, requests that come through a Cloudflare Access application can skip the OAuth flow. The server verifies the `Cf-Access-Jwt-Assertion` JWT (RS256 signature against your team's public keys, issuer and audience) before trusting it. Set both `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` to enable this; if either is missing, the header is ignored and every request must complete OAuth.
+
 ## The SSE vs Streamable HTTP gotcha
 
 If you're deploying behind Cloudflare (or any proxy that buffers SSE), you may hit a silent failure where Claude Code connects but never gets responses.
@@ -165,6 +169,8 @@ search:
 | `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers model |
 | `OAUTH_ISSUER_URL` | *(empty)* | Set to enable OAuth (e.g. `https://vault.yourdomain.com`) |
 | `OAUTH_PIN` | *(empty)* | Optional PIN for the OAuth approval page |
+| `CF_ACCESS_TEAM_DOMAIN` | *(empty)* | Comma-separated Cloudflare Access team domain(s) trusted as JWT issuer (e.g. `yourteam.cloudflareaccess.com`) |
+| `CF_ACCESS_AUD` | *(empty)* | AUD tag of the Cloudflare Access application |
 
 ## Metadata conventions
 

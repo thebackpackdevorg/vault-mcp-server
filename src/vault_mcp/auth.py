@@ -519,31 +519,116 @@ def create_approve_routes(provider: SimpleOAuthProvider) -> list:
 # Cloudflare Access bypass middleware
 # ---------------------------------------------------------------------------
 
-class CfAccessBypassMiddleware:
-    """Inject a Bearer token for requests already authenticated by Cloudflare Access.
+class CfAccessValidator:
+    """Verifies a Cloudflare Access application JWT (Cf-Access-Jwt-Assertion).
 
-    When a request arrives through the CF Access-protected domain, Cloudflare
-    injects a Cf-Access-Jwt-Assertion header. This middleware detects it and
-    injects a permanent Bearer token so the OAuth middleware accepts the request.
+    Trust is pinned to two things, both required:
+      - `iss` on an allowlist of the team domains that own the app.
+      - `aud` containing the app's Access AUD tag.
+
+    Signature is verified (RS256) against the team's rotating public keys,
+    fetched and cached from `https://<team>/cdn-cgi/access/certs`. A forged or
+    self-minted header can satisfy none of these, so a bare
+    `Cf-Access-Jwt-Assertion: anything` no longer grants access.
     """
 
-    def __init__(self, app, bypass_token: str):
+    def __init__(self, team_domains: list[str], audience: str):
+        # Normalize issuers to their canonical CF Access form (https, no trailing /).
+        self._audience = audience
+        self._clients: dict[str, "PyJWKClient"] = {}
+        from jwt import PyJWKClient
+
+        for td in team_domains:
+            td = td.strip().rstrip("/")
+            if not td:
+                continue
+            iss = td if td.startswith("http") else f"https://{td}"
+            # PyJWKClient caches keys in-process and refreshes on unknown kid.
+            self._clients[iss] = PyJWKClient(
+                f"{iss}/cdn-cgi/access/certs", cache_keys=True, lifespan=600
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._clients and self._audience)
+
+    def validate(self, token: str) -> bool:
+        """Return True only if the token is a genuine, unexpired CF Access JWT
+        for a trusted issuer and this app's audience. Runs sync (network on
+        cache miss) — call via asyncio.to_thread from async code."""
+        import jwt
+
+        try:
+            unverified = jwt.decode(token, options={"verify_signature": False})
+        except Exception:
+            return False
+        iss = str(unverified.get("iss", "")).rstrip("/")
+        client = self._clients.get(iss)
+        if client is None:
+            logger.warning("CF Access JWT from untrusted issuer rejected: %r", iss)
+            return False
+        try:
+            signing_key = client.get_signing_key_from_jwt(token)
+            jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=self._audience,
+                issuer=iss,
+                options={"require": ["exp", "iss", "aud"]},
+            )
+            return True
+        except Exception as exc:
+            logger.warning("CF Access JWT validation failed: %s", exc)
+            return False
+
+
+class CfAccessBypassMiddleware:
+    """Inject a Bearer token for requests genuinely authenticated by Cloudflare Access.
+
+    Cloudflare injects a `Cf-Access-Jwt-Assertion` header on requests that passed
+    an Access policy. This middleware only trusts that header after VERIFYING the
+    JWT (signature + issuer allowlist + audience) — see CfAccessValidator.
+
+    Fail-closed: if no validator is configured, or the JWT doesn't validate, the
+    header is stripped and NO bypass token is injected, so the request falls
+    through to the normal OAuth gate (→ 401). A hostname that is not behind
+    Access never receives a genuine Access JWT, so there the bypass is inert.
+    """
+
+    def __init__(self, app, bypass_token: str, validator: CfAccessValidator | None = None):
         self.app = app
         self.bypass_token = bypass_token
+        self.validator = validator
+        if validator is None or not validator.enabled:
+            logger.warning(
+                "CfAccessBypassMiddleware active WITHOUT a configured validator — "
+                "Cf-Access-Jwt-Assertion will be ignored (fail-closed). Set "
+                "CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD to enable the Access door."
+            )
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             headers = dict(scope.get("headers", []))
             cf_jwt = headers.get(b"cf-access-jwt-assertion")
+            trusted = False
+            if cf_jwt and self.validator and self.validator.enabled:
+                import asyncio
+
+                token = cf_jwt.decode("latin-1", "ignore")
+                trusted = await asyncio.to_thread(self.validator.validate, token)
+
+            # Always strip any client-supplied Authorization on this path so a
+            # caller can't smuggle their own bearer; only inject when verified.
             if cf_jwt:
-                # Request already authenticated by Cloudflare Access — inject Bearer token
                 new_headers = [
                     (k, v) for k, v in scope["headers"]
                     if k.lower() != b"authorization"
                 ]
-                new_headers.append(
-                    (b"authorization", f"Bearer {self.bypass_token}".encode())
-                )
+                if trusted:
+                    new_headers.append(
+                        (b"authorization", f"Bearer {self.bypass_token}".encode())
+                    )
                 scope = dict(scope, headers=new_headers)
 
         await self.app(scope, receive, send)
