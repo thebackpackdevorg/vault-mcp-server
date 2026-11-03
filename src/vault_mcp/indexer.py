@@ -7,9 +7,33 @@ from pathlib import Path
 
 import chromadb
 from sentence_transformers import SentenceTransformer
+from watchfiles import Change, awatch
 
 from .chunker import chunk_document
 from .parser import infer_domain
+
+
+def is_indexable(rel_path) -> bool:
+    """Single source of truth for "does this vault-relative path belong in the index?".
+
+    Both the full walk (:meth:`VaultIndexer._list_vault_files`) and the filesystem
+    watcher (:meth:`VaultIndexer._watch_vault`) must use this. When the two filters
+    were written separately the watcher checked only the ``.md`` suffix, so it
+    indexed ``.obsidian/``, ``_review/`` and ``_inbox.md`` -- paths the walk
+    deliberately skips. The real problem is not the extra files: it is that the
+    index contents then depend on how you got there, because the watcher adds them
+    and the next ``index_all(force=True)`` drops them again.
+
+    The suffix check is case-sensitive to match the walk's ``rglob("*.md")``,
+    which is case-sensitive on Linux: ``NOTES.MD`` is not indexed by either.
+    """
+    parts = Path(str(rel_path)).parts
+    if not parts:
+        return False
+    if not parts[-1].endswith(".md"):
+        return False
+    return not any(part.startswith((".", "_")) for part in parts)
+
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +41,21 @@ logger = logging.getLogger(__name__)
 class VaultIndexer:
     """Manages chunking, embedding, and semantic search over the vault."""
 
-    def __init__(self, vault_path: Path, chroma_path: Path, model_name: str):
+    def __init__(
+        self,
+        vault_path: Path,
+        chroma_path: Path,
+        model_name: str,
+        watch_files: bool = True,
+    ):
         self.vault_path = vault_path
         self.chroma_path = chroma_path
         self.model_name = model_name
+        self.watch_files = watch_files
         self._model: SentenceTransformer | None = None
         self._collection: chromadb.Collection | None = None
         self._ready = False
+        self._watch_task: asyncio.Task | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -52,6 +84,78 @@ class VaultIndexer:
             stats["files"], stats["chunks"], stats["elapsed"],
         )
         self._ready = True
+
+        if self.watch_files:
+            self._watch_task = asyncio.create_task(self._watch_vault())
+
+    async def stop(self):
+        """Cancel the filesystem watcher and wait for it to finish.
+
+        Without this ``_watch_task`` outlives shutdown: it holds the indexer and an
+        open ``awatch`` generator, so the process does not exit cleanly and tests
+        leak a pending task.
+        """
+        task = self._watch_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._watch_task = None
+
+    async def _watch_vault(self):
+        """Background task: watch VAULT_PATH for .md changes and re-index live.
+
+        Uses watchfiles to react to external file changes — git pull, manual
+        edits in Obsidian, sync scripts, etc. Without this, vault-mcp's index
+        only catches changes made through its own write tools and at server
+        startup.
+
+        Files written through ``vault_write``/``vault_edit`` are indexed twice:
+        the tool schedules ``index_file`` and the watcher then sees the same
+        write. That costs one redundant embed but is otherwise harmless, because
+        ``_index_single_file`` deletes the file's chunks and upserts them under
+        deterministic IDs (``path::section::n``), so both passes converge on the
+        same rows.
+        """
+        logger.info("Filesystem watcher started on %s", self.vault_path)
+        loop = asyncio.get_running_loop()
+
+        try:
+            async for changes in awatch(self.vault_path, recursive=True):
+                for change_type, abs_path_str in changes:
+                    abs_path = Path(abs_path_str)
+                    try:
+                        rel = str(abs_path.relative_to(self.vault_path))
+                    except ValueError:
+                        continue
+                    if not is_indexable(rel):
+                        continue
+
+                    if change_type == Change.deleted:
+                        logger.info("Watcher: removing %s", rel)
+                        try:
+                            await loop.run_in_executor(
+                                None, self._delete_files_chunks, [rel]
+                            )
+                        except Exception:
+                            logger.exception("Watcher: failed to delete %s", rel)
+                    else:
+                        logger.info(
+                            "Watcher: re-indexing %s (%s)", rel, change_type.name
+                        )
+                        try:
+                            await self.index_file(rel)
+                        except Exception:
+                            logger.exception("Watcher: failed to index %s", rel)
+        except asyncio.CancelledError:
+            logger.info("Filesystem watcher cancelled")
+            raise
+        except Exception:
+            logger.exception("Filesystem watcher crashed (auto-reindex disabled)")
 
     async def index_all(self, force: bool = False) -> dict:
         """Full or incremental index of the vault.
@@ -189,7 +293,7 @@ class VaultIndexer:
         files: list[str] = []
         for p in sorted(self.vault_path.rglob("*.md")):
             rel = str(p.relative_to(self.vault_path))
-            if any(part.startswith(".") or part.startswith("_") for part in Path(rel).parts):
+            if not is_indexable(rel):
                 continue
             files.append(rel)
         return files

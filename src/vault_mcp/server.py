@@ -61,6 +61,12 @@ ALLOWED_HOSTS = [
     h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
 ]
 
+# Filesystem watcher: re-index .md files in VAULT_PATH on external changes
+# (git pull, manual edits, sync scripts). Set VAULT_WATCH=false to disable.
+VAULT_WATCH = os.environ.get("VAULT_WATCH", "true").strip().lower() not in (
+    "false", "0", "no", "off",
+)
+
 # ---------------------------------------------------------------------------
 # MCP Server (with optional OAuth)
 # ---------------------------------------------------------------------------
@@ -111,7 +117,7 @@ if OAUTH_ISSUER_URL:
 mcp = FastMCP(**_mcp_kwargs)
 
 # Semantic search indexer
-indexer = VaultIndexer(VAULT_PATH, CHROMA_PATH, EMBEDDING_MODEL)
+indexer = VaultIndexer(VAULT_PATH, CHROMA_PATH, EMBEDDING_MODEL, watch_files=VAULT_WATCH)
 
 
 def _list_md_files() -> list[str]:
@@ -463,8 +469,15 @@ def main():
     @asynccontextmanager
     async def lifespan_with_index(app_instance):
         async with original_lifespan(app_instance) as state:
-            asyncio.create_task(indexer.start())
-            yield state
+            start_task = asyncio.create_task(indexer.start())
+            try:
+                yield state
+            finally:
+                # The initial index can still be running at shutdown; cancel it
+                # first, or it would go on to start the watcher after stop().
+                start_task.cancel()
+                await asyncio.gather(start_task, return_exceptions=True)
+                await indexer.stop()
 
     app.router.lifespan_context = lifespan_with_index
 
